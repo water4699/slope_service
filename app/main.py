@@ -2,14 +2,16 @@
 
 端点：
   GET  /health                              健康检查（含 DB 连通）
-  GET  /allow/{variant}?n=<N>               下单决策；n 留空则读 median_trend_risk_config.slope_n
+  GET  /allow/{variant}?n=<N>               下单决策；n 留空读 median_trend_risk_config.slope_n
   GET  /status?variant=<V>&n=<N>            状态诊断
-  POST /recompute                           遍历所有 slope_n 非 NULL 的 variant 强制重算
+  POST /signal                              登记信号（策略触发时调，幂等）
+  POST /settlement                          回填 winner（结算时调）
+  POST /recompute                           强制重算所有已启用 variant
 
 认证：
-  非公开读端点 (POST /recompute) 必须带 X-Slope-Token
-  GET /allow 和 GET /status 默认无需 token（同机 127.0.0.1 调用）
-  如需加固，设 SLOPE_REQUIRE_TOKEN=1 后所有端点都要 token
+  POST /signal / /settlement / /recompute 必须带 X-Slope-Token
+  GET /allow / /status 默认无需 token（同机 127.0.0.1）
+  若希望 GET 也要 token：设 SLOPE_REQUIRE_TOKEN=1
 """
 from __future__ import annotations
 
@@ -18,12 +20,15 @@ import os
 from typing import Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
-from fastapi.responses import JSONResponse
 
 from .models import (
     AllowResponse,
     HealthResponse,
     RecomputeResponse,
+    SettlementPostBody,
+    SettlementPostResponse,
+    SignalPostBody,
+    SignalPostResponse,
     StatusResponse,
 )
 from .service import SlopeService
@@ -37,10 +42,7 @@ logging.basicConfig(
 )
 
 
-# ─── 配置 ────────────────────────────────────────────────────────────────────
-
 def _build_dsn() -> str:
-    """从环境变量拼 psycopg2 DSN。默认指向 PredictLab 同机 PG。"""
     host = os.getenv("POSTGRES_HOST", "127.0.0.1")
     port = os.getenv("POSTGRES_PORT", "5432")
     db   = os.getenv("POSTGRES_DB",   "predictlab")
@@ -54,31 +56,26 @@ SLOPE_REQUIRE_TOKEN_ALL = os.getenv("SLOPE_REQUIRE_TOKEN", "0") == "1"
 
 
 def _require_token(x_slope_token: Optional[str] = Header(None)) -> None:
-    """POST /recompute 等写端点必须带 token。"""
     if not SLOPE_TOKEN:
-        return  # 未配置 token 则放行（本地开发）
+        return
     if x_slope_token != SLOPE_TOKEN:
         raise HTTPException(status_code=401, detail="invalid slope token")
 
 
 def _optional_token(x_slope_token: Optional[str] = Header(None)) -> None:
-    """GET 端点的可选认证。SLOPE_REQUIRE_TOKEN=1 时必须带。"""
     if not SLOPE_REQUIRE_TOKEN_ALL:
         return
     _require_token(x_slope_token)
 
 
-# ─── 应用 ────────────────────────────────────────────────────────────────────
-
 app = FastAPI(
     title="Slope Indicator Service",
-    version="0.1.0",
-    description="Polymarket 策略 PnL 斜率熔断闸门服务",
+    version="0.2.0",
+    description="Polymarket 策略 PnL 斜率熔断闸门服务（文档方案）",
 )
 
 
 def _service() -> SlopeService:
-    # 全局单例；psycopg2 连接是每次 query 新建，不缓存连接对象
     return SlopeService(_build_dsn(), default_warmup_allow=False)
 
 
@@ -97,6 +94,41 @@ def health() -> HealthResponse:
         logger.warning(f"db health check failed: {exc}")
         db_ok = False
     return HealthResponse(ok=db_ok, db_reachable=db_ok)
+
+
+@app.post("/signal", response_model=SignalPostResponse,
+          dependencies=[Depends(_require_token)])
+def post_signal(body: SignalPostBody) -> SignalPostResponse:
+    svc = _service()
+    try:
+        inserted = svc.record_signal(
+            variant=body.variant,
+            signal_ts=body.signal_ts,
+            direction=body.direction.upper(),
+            lim=float(body.lim),
+            market_condition_id=body.market_condition_id,
+            market_slug=body.market_slug,
+            source=body.source,
+        )
+    except (ValueError, AssertionError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return SignalPostResponse(ok=True, inserted=inserted)
+
+
+@app.post("/settlement", response_model=SettlementPostResponse,
+          dependencies=[Depends(_require_token)])
+def post_settlement(body: SettlementPostBody) -> SettlementPostResponse:
+    svc = _service()
+    try:
+        affected = svc.record_settlement(
+            variant=body.variant,
+            signal_ts=body.signal_ts,
+            market_condition_id=body.market_condition_id,
+            winner=body.winner.upper(),
+        )
+    except (ValueError, AssertionError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return SettlementPostResponse(ok=True, affected=affected)
 
 
 @app.get("/allow/{variant}", response_model=AllowResponse,

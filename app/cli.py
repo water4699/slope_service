@@ -1,10 +1,11 @@
 """Slope Indicator Service CLI
 
 Usage:
-    python -m app.cli status                  # 遍历所有已启用 variant
+    python -m app.cli status
     python -m app.cli status --variant btc_5m --n 50
-    python -m app.cli recompute               # 强制重算所有
-    python -m app.cli watch                   # 30s 轮询监控面板
+    python -m app.cli recompute
+    python -m app.cli watch
+    python -m app.cli bootstrap --variant btc_5m --limit 500
 """
 from __future__ import annotations
 
@@ -15,14 +16,13 @@ import time
 from pathlib import Path
 from typing import Optional
 
-# CLI 手动跑时自动加载 .env（systemd 走 EnvironmentFile 不走这里）
 try:
     from dotenv import load_dotenv
     _env_path = Path(__file__).resolve().parent.parent / ".env"
     if _env_path.exists():
         load_dotenv(_env_path)
 except ImportError:
-    pass  # python-dotenv 不是硬依赖；systemd 用户可以跳过
+    pass
 
 from .service import SlopeService
 
@@ -37,7 +37,6 @@ def _build_dsn() -> str:
 
 
 def _active_variants(svc: SlopeService):
-    """从 median_trend_risk_config 拉出 slope_n 非 NULL 的 variant。"""
     import psycopg2
     with psycopg2.connect(svc._dsn) as conn:
         with conn.cursor() as cur:
@@ -50,34 +49,32 @@ def _active_variants(svc: SlopeService):
             return cur.fetchall()
 
 
-def cmd_status(svc: SlopeService, variant: Optional[str], n: Optional[int]) -> None:
+def cmd_status(svc, variant, n):
     rows = [(variant, n)] if variant else _active_variants(svc)
     if not rows:
         print("(no variant with slope_n configured)")
         return
-    print(f"{'variant':<12} {'N':>4} {'slope':>10} {'allow':>6} {'n/N':>8} {'ms':>5} {'last_signal_bj':<25}")
+    print(f"{'variant':<12} {'N':>4} {'slope':>10} {'allow':>6} {'n/N':>10} {'ms':>5} {'last_settle_bj':<25}")
     for v, nw in rows:
         st = svc.get_status(v, nw)
         slope_s = f"{st.slope_value:.2f}" if st.slope_value is not None else "—"
         allow_s = "YES" if st.allow_trade else ("NO" if st.allow_trade is False else "—")
-        last_s = st.last_signal_ts.astimezone().strftime("%Y-%m-%d %H:%M:%S") if st.last_signal_ts else "—"
+        last_s = st.last_settle_ts.astimezone().strftime("%Y-%m-%d %H:%M:%S") if st.last_settle_ts else "—"
         print(f"{st.variant:<12} {st.n_window:>4} {slope_s:>10} {allow_s:>6} "
-              f"{st.n_in_window}/{st.n_window:<4} {st.computed_ms or 0:>5} {last_s:<25}")
+              f"{st.n_in_window}/{st.n_window:<6} {st.computed_ms or 0:>5} {last_s:<25}")
 
 
-def cmd_recompute(svc: SlopeService) -> None:
+def cmd_recompute(svc):
     rows = svc.recompute_all()
     print(f"recomputed {len(rows)} variants:")
     for st in rows:
         slope_s = f"{st.slope_value:.2f}" if st.slope_value is not None else "—"
-        print(f"  {st.variant:<12} N={st.n_window:<4} slope={slope_s:>10} "
-              f"n_in_window={st.n_in_window}")
+        print(f"  {st.variant:<12} N={st.n_window:<4} slope={slope_s:>10} n_in_window={st.n_in_window}")
 
 
-def cmd_watch(svc: SlopeService, interval: float) -> None:
+def cmd_watch(svc, interval):
     try:
         while True:
-            # 清屏 + 回到顶
             sys.stdout.write("\033[2J\033[H")
             sys.stdout.flush()
             print(f"=== Slope Indicator Service watch (refresh every {interval}s) ===\n")
@@ -87,18 +84,88 @@ def cmd_watch(svc: SlopeService, interval: float) -> None:
         print("\n(stopped)")
 
 
+def cmd_bootstrap(svc, variant: str, limit: int):
+    """从 PredictLab 历史数据灌入 slope_signal_outcomes（用 limit_price 和
+    市场最终 outcome）。
+
+    数据源：median_trend_signals JOIN median_trend_orders（拿 settlement_outcome）
+    只取 allowed=TRUE + dry_run=FALSE + settlement_outcome IN (UP,DOWN) 的。
+    被 slope gate 拦下的历史信号不在 PredictLab 表里带 lim，无法 bootstrap。
+    """
+    import psycopg2
+    count = 0
+    with psycopg2.connect(svc._dsn) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT ON (s.id)
+                       s.variant,
+                       s.signal_ts,
+                       s.market_condition_id,
+                       s.market_slug,
+                       s.direction,
+                       s.limit_price::float AS lim,
+                       o.settlement_outcome AS winner
+                FROM median_trend_signals s
+                JOIN median_trend_orders o ON o.signal_id = s.id
+                WHERE s.variant = %s
+                  AND s.allowed = TRUE
+                  AND s.dry_run = FALSE
+                  AND s.limit_price IS NOT NULL
+                  AND s.direction IN ('UP','DOWN')
+                  AND o.dry_run = FALSE
+                  AND o.settlement_outcome IN ('UP','DOWN')
+                ORDER BY s.id, o.id
+                """,
+                (variant,),
+            )
+            rows = cur.fetchall()
+            # 按 signal_ts DESC 取 LIMIT，然后反转为时间正序插入
+            rows.sort(key=lambda r: r[1], reverse=True)
+            rows = rows[:limit][::-1]
+
+            for v, signal_ts, cond, slug, direction, lim, winner in rows:
+                try:
+                    ins = svc.record_signal(
+                        variant=v, signal_ts=signal_ts,
+                        direction=direction, lim=float(lim),
+                        market_condition_id=cond, market_slug=slug,
+                        source="backtest_bootstrap",
+                    )
+                    if ins:
+                        svc.record_settlement(
+                            variant=v, signal_ts=signal_ts,
+                            winner=winner,
+                        )
+                        count += 1
+                except (ValueError, AssertionError) as exc:
+                    print(f"  skip {v}@{signal_ts}: {exc}")
+    print(f"bootstrap: inserted {count} records for {variant}")
+    # 再重算一次 cache
+    n = svc._load_config_n(variant)
+    if n is not None:
+        st = svc.get_status(variant, n)
+        slope_s = f"{st.slope_value:.2f}" if st.slope_value is not None else "—"
+        print(f"after bootstrap {variant} slope={slope_s} n_in_window={st.n_in_window}/{st.n_window}")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Slope Indicator Service CLI")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sp = sub.add_parser("status", help="print slope status")
+    sp = sub.add_parser("status")
     sp.add_argument("--variant", default=None)
     sp.add_argument("--n", type=int, default=None)
 
-    sub.add_parser("recompute", help="force recompute all active variants")
+    sub.add_parser("recompute")
 
-    sp = sub.add_parser("watch", help="monitor panel (Ctrl+C to quit)")
+    sp = sub.add_parser("watch")
     sp.add_argument("--interval", type=float, default=30.0)
+
+    sp = sub.add_parser("bootstrap",
+        help="从 PredictLab 历史数据灌入 slope_signal_outcomes")
+    sp.add_argument("--variant", required=True)
+    sp.add_argument("--limit", type=int, default=500)
 
     args = p.parse_args()
     svc = SlopeService(_build_dsn(), default_warmup_allow=False)
@@ -109,6 +176,8 @@ def main() -> None:
         cmd_recompute(svc)
     elif args.cmd == "watch":
         cmd_watch(svc, args.interval)
+    elif args.cmd == "bootstrap":
+        cmd_bootstrap(svc, args.variant, args.limit)
 
 
 if __name__ == "__main__":

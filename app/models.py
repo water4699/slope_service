@@ -7,6 +7,38 @@ from typing import List, Optional
 from pydantic import BaseModel, Field
 
 
+# ─── 写入端 ────────────────────────────────────────────────────────────────
+
+class SignalPostBody(BaseModel):
+    variant: str
+    signal_ts: datetime                 # ISO8601 / epoch-number 都行（pydantic 会解析）
+    direction: str                      # 'UP' / 'DOWN'
+    lim: float = Field(..., gt=0.5, le=1.0)
+    market_condition_id: Optional[str] = None
+    market_slug: Optional[str] = None
+    source: str = "live"
+
+
+class SignalPostResponse(BaseModel):
+    ok: bool = True
+    inserted: bool                      # False = 已存在（幂等）
+
+
+class SettlementPostBody(BaseModel):
+    # 二选一定位键：优先 (variant, signal_ts)；否则 market_condition_id
+    variant: Optional[str] = None
+    signal_ts: Optional[datetime] = None
+    market_condition_id: Optional[str] = None
+    winner: str                          # 'UP' / 'DOWN'
+
+
+class SettlementPostResponse(BaseModel):
+    ok: bool = True
+    affected: int                        # 被回填的行数
+
+
+# ─── 读取端 ────────────────────────────────────────────────────────────────
+
 class AllowResponse(BaseModel):
     variant: str
     allow_trade: bool
@@ -14,8 +46,8 @@ class AllowResponse(BaseModel):
     n_in_window: int = 0
     slope_value: Optional[float] = None
     warmup: bool = False
-    enabled: bool = True                  # slope_n IS NULL → enabled=False
-    reason: Optional[str] = None          # 诊断用："enabled=false" / "warmup" / "slope<0" / "ok"
+    enabled: bool = True
+    reason: Optional[str] = None
 
 
 class StatusResponse(BaseModel):
