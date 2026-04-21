@@ -94,6 +94,7 @@ def cmd_bootstrap(svc, variant: str, limit: int):
     """
     import psycopg2
     count = 0
+    skipped = 0
     with psycopg2.connect(svc._dsn) as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -104,14 +105,14 @@ def cmd_bootstrap(svc, variant: str, limit: int):
                        s.market_condition_id,
                        s.market_slug,
                        s.direction,
-                       s.limit_price::float AS lim,
+                       s.limit_price::float AS lim_raw,
+                       s.median_value::float AS median_value,
                        o.settlement_outcome AS winner
                 FROM median_trend_signals s
                 JOIN median_trend_orders o ON o.signal_id = s.id
                 WHERE s.variant = %s
                   AND s.allowed = TRUE
                   AND s.dry_run = FALSE
-                  AND s.limit_price IS NOT NULL
                   AND s.direction IN ('UP','DOWN')
                   AND o.dry_run = FALSE
                   AND o.settlement_outcome IN ('UP','DOWN')
@@ -124,11 +125,37 @@ def cmd_bootstrap(svc, variant: str, limit: int):
             rows.sort(key=lambda r: r[1], reverse=True)
             rows = rows[:limit][::-1]
 
-            for v, signal_ts, cond, slug, direction, lim, winner in rows:
+            for v, signal_ts, cond, slug, direction, lim_raw, median_value, winner in rows:
+                # 统一从 median_value + direction 重算 buy_lim，避免历史数据里
+                # DOWN 方向 limit_price 可能存的是 median 而非 1-median 的旧版格式问题。
+                # 退路：如果 median_value 为空，才 fallback 到 limit_price。
+                buy_lim = None
+                if median_value is not None:
+                    mv = float(median_value)
+                    if direction == "UP":
+                        buy_lim = mv
+                    else:  # DOWN
+                        buy_lim = 1.0 - mv
+                elif lim_raw is not None:
+                    # limit_price 已经是买入价（新版存的）；DOWN 若 < 0.5 说明是旧版存了 median
+                    raw = float(lim_raw)
+                    if direction == "DOWN" and raw < 0.5:
+                        buy_lim = 1.0 - raw
+                    else:
+                        buy_lim = raw
+                if buy_lim is None:
+                    skipped += 1
+                    continue
+                # clamp 到 (0.5, 1.0]；边界 0.5 也排除（pnl=100 刚好也没意义）
+                if not (0.5 < buy_lim <= 1.0):
+                    # 极小概率（median 刚好在边界附近），跳过这笔
+                    skipped += 1
+                    continue
+
                 try:
                     ins = svc.record_signal(
                         variant=v, signal_ts=signal_ts,
-                        direction=direction, lim=float(lim),
+                        direction=direction, lim=buy_lim,
                         market_condition_id=cond, market_slug=slug,
                         source="backtest_bootstrap",
                     )
@@ -140,7 +167,8 @@ def cmd_bootstrap(svc, variant: str, limit: int):
                         count += 1
                 except (ValueError, AssertionError) as exc:
                     print(f"  skip {v}@{signal_ts}: {exc}")
-    print(f"bootstrap: inserted {count} records for {variant}")
+                    skipped += 1
+    print(f"bootstrap: inserted {count} records for {variant} (skipped {skipped})")
     # 再重算一次 cache
     n = svc._load_config_n(variant)
     if n is not None:
