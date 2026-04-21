@@ -1,0 +1,22 @@
+[Unit]
+Description=Slope Indicator Service (Polymarket 斜率熔断闸门)
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=ops
+WorkingDirectory=/home/ops/slope_service
+EnvironmentFile=/home/ops/slope_service/.env
+ExecStart=/home/ops/slope_service/.venv/bin/uvicorn app.main:app \
+    --host 127.0.0.1 --port 8020 --workers 1 --log-level info
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
