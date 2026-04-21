@@ -12,7 +12,17 @@ import argparse
 import os
 import sys
 import time
+from pathlib import Path
 from typing import Optional
+
+# CLI 手动跑时自动加载 .env（systemd 走 EnvironmentFile 不走这里）
+try:
+    from dotenv import load_dotenv
+    _env_path = Path(__file__).resolve().parent.parent / ".env"
+    if _env_path.exists():
+        load_dotenv(_env_path)
+except ImportError:
+    pass  # python-dotenv 不是硬依赖；systemd 用户可以跳过
 
 from .service import SlopeService
 
